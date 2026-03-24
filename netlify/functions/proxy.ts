@@ -19,9 +19,7 @@ const RATE_LIMIT = {
 } as const;
 
 const ALLOWED_ORIGINS: string[] = [
-  // Add your Netlify domain once deployed, e.g.:
-  // 'https://your-site.netlify.app',
-  // 'https://yourcustomdomain.com',
+  'https://curious-profiterole-6c8c76.netlify.app',
 ];
 
 function getRateLimit(ip: string): RateLimitResult {
