@@ -29,29 +29,91 @@ interface AnthropicResponse {
   stop_reason?: string;
 }
 
-function makeTagInput(wrapperId: string, inputId: string): () => string[] {
+interface SavedProfile {
+  name?: string;
+  title?: string;
+  experience?: string;
+  location?: string;
+  jobtype?: string;
+  notes?: string;
+  roles?: string[];
+  skills?: string[];
+}
+
+interface TagInput {
+  get: () => string[];
+  set: (values: string[]) => void;
+}
+
+// --- Tag inputs ---
+
+function makeTagInput(wrapperId: string, inputId: string): TagInput {
   const wrapper = document.getElementById(wrapperId)!;
   const input = document.getElementById(inputId) as HTMLInputElement;
   const tags: string[] = [];
+
+  function addTag(val: string): void {
+    if (!val || tags.includes(val)) return;
+    tags.push(val);
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.innerHTML = `${val}<button onclick="this.parentElement.remove()">×</button>`;
+    wrapper.insertBefore(tag, input);
+  }
+
   input.addEventListener('keydown', (e: KeyboardEvent) => {
     if ((e.key === 'Enter' || e.key === ',') && input.value.trim()) {
       e.preventDefault();
       const val = input.value.trim().replace(/,+$/, '');
-      if (val && !tags.includes(val)) {
-        tags.push(val);
-        const tag = document.createElement('span');
-        tag.className = 'tag';
-        tag.innerHTML = `${val}<button onclick="this.parentElement.remove()">×</button>`;
-        wrapper.insertBefore(tag, input);
-      }
+      addTag(val);
       input.value = '';
     }
   });
-  return () => tags;
+
+  return {
+    get: () => tags,
+    set: (values: string[]) => {
+      wrapper.querySelectorAll('.tag').forEach(el => el.remove());
+      tags.length = 0;
+      values.forEach(addTag);
+    },
+  };
 }
 
-const getRoles = makeTagInput('roles-wrapper', 'roles-input');
-const getSkills = makeTagInput('skills-wrapper', 'skills-input');
+const roles = makeTagInput('roles-wrapper', 'roles-input');
+const skills = makeTagInput('skills-wrapper', 'skills-input');
+
+// --- Profile persistence ---
+
+async function loadProfile(): Promise<void> {
+  try {
+    const resp = await fetch('/api/profile');
+    if (!resp.ok) return;
+    const profile = await resp.json() as SavedProfile;
+
+    if (profile.name) (document.getElementById('name') as HTMLInputElement).value = profile.name;
+    if (profile.title) (document.getElementById('title') as HTMLInputElement).value = profile.title;
+    if (profile.experience) (document.getElementById('experience') as HTMLSelectElement).value = profile.experience;
+    if (profile.location) (document.getElementById('location') as HTMLSelectElement).value = profile.location;
+    if (profile.jobtype) (document.getElementById('jobtype') as HTMLSelectElement).value = profile.jobtype;
+    if (profile.notes) (document.getElementById('notes') as HTMLTextAreaElement).value = profile.notes;
+    if (profile.roles?.length) roles.set(profile.roles);
+    if (profile.skills?.length) skills.set(profile.skills);
+  } catch {
+    // Ignore — form just won't be pre-filled
+  }
+}
+
+function saveProfile(profile: SavedProfile): void {
+  // Fire-and-forget — don't block the agent run
+  void fetch('/api/profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  }).catch(() => {});
+}
+
+// --- Agent log ---
 
 function addLog(msg: string, type = 'info'): void {
   const log = document.getElementById('log')!;
@@ -64,6 +126,8 @@ function addLog(msg: string, type = 'info'): void {
   log.scrollTop = log.scrollHeight;
 }
 
+// --- Main agent run ---
+
 async function runAgent(): Promise<void> {
   const name = (document.getElementById('name') as HTMLInputElement).value.trim();
   const title = (document.getElementById('title') as HTMLInputElement).value.trim();
@@ -71,13 +135,16 @@ async function runAgent(): Promise<void> {
   const location = (document.getElementById('location') as HTMLSelectElement).value;
   const jobtype = (document.getElementById('jobtype') as HTMLSelectElement).value;
   const notes = (document.getElementById('notes') as HTMLTextAreaElement).value.trim();
-  const roles = getRoles();
-  const skills = getSkills();
+  const rolesList = roles.get();
+  const skillsList = skills.get();
 
-  if (!title && roles.length === 0) {
+  if (!title && rolesList.length === 0) {
     alert('Please enter a current title or add at least one target role.');
     return;
   }
+
+  // Save profile before running so it persists for next time
+  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList });
 
   const btn = document.getElementById('run-btn') as HTMLButtonElement;
   const spinner = document.getElementById('spinner')!;
@@ -96,15 +163,15 @@ async function runAgent(): Promise<void> {
   document.getElementById('stat-email')!.textContent = '—';
 
   addLog('Agent initialised', 'info');
-  addLog(`Profile: ${name || 'Candidate'} · ${title || roles[0] || 'TBD'} · ${experience || 'any exp'}`, 'info');
+  addLog(`Profile: ${name || 'Candidate'} · ${title || rolesList[0] || 'TBD'} · ${experience || 'any exp'}`, 'info');
   addLog(`Preferences: ${location || 'Any location'} · ${jobtype}`, 'info');
 
   const profileDesc = [
     name ? `Name: ${name}` : '',
     title ? `Current role: ${title}` : '',
     experience ? `Experience: ${experience}` : '',
-    roles.length > 0 ? `Target roles: ${roles.join(', ')}` : '',
-    skills.length > 0 ? `Skills: ${skills.join(', ')}` : '',
+    rolesList.length > 0 ? `Target roles: ${rolesList.join(', ')}` : '',
+    skillsList.length > 0 ? `Skills: ${skillsList.join(', ')}` : '',
     location ? `Location preference: ${location}` : '',
     `Job type: ${jobtype}`,
     notes ? `Additional notes: ${notes}` : '',
@@ -165,7 +232,6 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
       const searches = (raw.content ?? []).filter(b => b.type === 'tool_use');
       addLog(`Web search: ${searches.map(b => JSON.stringify((b.input as Record<string, unknown>)?.query ?? b.name)).join(', ')}`, 'search');
 
-      // Append assistant turn and empty tool results — Anthropic executes the search server-side
       messages.push({ role: 'assistant', content: raw.content ?? [] });
       messages.push({
         role: 'user',
@@ -180,7 +246,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
   } catch (err) {
     addLog('API error: ' + (err as Error).message, 'error');
     addLog('Using curated fallback results for demo...', 'info');
-    data = generateFallback(name, title, roles, skills, location, jobtype);
+    data = generateFallback(name, title, rolesList, skillsList, location, jobtype);
   }
 
   const jobs = data.jobs ?? [];
@@ -275,24 +341,26 @@ function delay(ms: number): Promise<void> {
 function generateFallback(
   name: string,
   title: string,
-  roles: string[],
-  skills: string[],
+  rolesList: string[],
+  skillsList: string[],
   location: string,
   jobtype: string,
 ): AgentResponse {
-  const role = roles[0] || title || 'Product Manager';
+  const role = rolesList[0] || title || 'Product Manager';
   const loc = location || 'Remote';
   return {
     email_subject: `${name || 'Hi'}, your top job matches for today`,
     email_body: `Hi ${name || 'there'},\n\nHere are your top job matches for today:\n\n1. ${role} at Acme Corp — 95% match\n2. Senior ${role} at BuildCo — 88% match\n3. Lead ${role} at Startify — 82% match\n\nThree new listings appeared overnight. Two are marked as high-priority matches based on your skills and preferences.\n\nHappy job hunting!\n— Launchpad Agent`,
     jobs: [
-      { title: role, company: 'Figma', location: loc, type: jobtype, match_score: 95, is_new: true, skills_matched: skills.slice(0, 3), url: 'https://www.figma.com/careers', reason: 'Strong alignment with your experience and target role.' },
-      { title: `Senior ${role}`, company: 'Linear', location: loc, type: jobtype, match_score: 91, is_new: false, skills_matched: skills.slice(0, 2), url: 'https://linear.app/careers', reason: 'Linear is hiring for this exact role; culture and stage match your notes.' },
-      { title: `Lead ${role}`, company: 'Notion', location: loc, type: jobtype, match_score: 87, is_new: true, skills_matched: skills.slice(0, 2), url: 'https://www.notion.so/careers', reason: "Notion's fast-growing team is a great fit for your background." },
-      { title: role, company: 'Vercel', location: loc, type: jobtype, match_score: 82, is_new: false, skills_matched: skills.slice(0, 1), url: 'https://vercel.com/careers', reason: 'Developer-focused company aligned with your skills.' },
-      { title: `${role} II`, company: 'Stripe', location: loc, type: jobtype, match_score: 78, is_new: false, skills_matched: skills.slice(0, 1), url: 'https://stripe.com/jobs', reason: 'Stripe values strong technical skills and offers excellent compensation.' },
+      { title: role, company: 'Figma', location: loc, type: jobtype, match_score: 95, is_new: true, skills_matched: skillsList.slice(0, 3), url: 'https://www.figma.com/careers', reason: 'Strong alignment with your experience and target role.' },
+      { title: `Senior ${role}`, company: 'Linear', location: loc, type: jobtype, match_score: 91, is_new: false, skills_matched: skillsList.slice(0, 2), url: 'https://linear.app/careers', reason: 'Linear is hiring for this exact role; culture and stage match your notes.' },
+      { title: `Lead ${role}`, company: 'Notion', location: loc, type: jobtype, match_score: 87, is_new: true, skills_matched: skillsList.slice(0, 2), url: 'https://www.notion.so/careers', reason: "Notion's fast-growing team is a great fit for your background." },
+      { title: role, company: 'Vercel', location: loc, type: jobtype, match_score: 82, is_new: false, skills_matched: skillsList.slice(0, 1), url: 'https://vercel.com/careers', reason: 'Developer-focused company aligned with your skills.' },
+      { title: `${role} II`, company: 'Stripe', location: loc, type: jobtype, match_score: 78, is_new: false, skills_matched: skillsList.slice(0, 1), url: 'https://stripe.com/jobs', reason: 'Stripe values strong technical skills and offers excellent compensation.' },
     ],
   };
 }
 
+// Load saved profile on page load, then expose runAgent globally
+loadProfile();
 (window as unknown as Record<string, unknown>).runAgent = runAgent;
