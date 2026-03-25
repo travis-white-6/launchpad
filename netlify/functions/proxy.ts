@@ -37,6 +37,31 @@ function getRateLimit(ip: string): RateLimitResult {
   return { allowed: remaining >= 0, remaining: Math.max(0, remaining) };
 }
 
+async function sendRateLimitAlert(ip: string): Promise<void> {
+  const apiKey = process.env.MAILGUN_API_KEY;
+  const domain = process.env.MAILGUN_DOMAIN;
+  if (!apiKey || !domain) return;
+
+  const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
+  const body = new URLSearchParams({
+    from: `Launchpad <noreply@${domain}>`,
+    to: 'me@traviswhite.dev',
+    subject: 'Launchpad — rate limit hit',
+    text: `The rate limiter was triggered on the Launchpad proxy.\n\nIP: ${ip}\nTime: ${new Date().toISOString()}\n\nThis IP has exceeded 5 requests per minute.`,
+  });
+
+  await fetch(`https://api.mailgun.net/v3/${domain}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body.toString(),
+  }).catch(() => {
+    // Fire-and-forget — don't let email failure affect the 429 response
+  });
+}
+
 function cleanupStore(): void {
   const now = Date.now();
   for (const [ip, record] of rateLimitStore.entries()) {
@@ -68,6 +93,7 @@ export default async (req: Request): Promise<Response> => {
   const { allowed, remaining } = getRateLimit(ip);
 
   if (!allowed) {
+    void sendRateLimitAlert(ip);
     return new Response(
       JSON.stringify({ error: 'Rate limit exceeded. Please wait a minute and try again.' }),
       {

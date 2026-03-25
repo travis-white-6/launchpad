@@ -16,6 +16,19 @@ interface AgentResponse {
   email_body?: string;
 }
 
+interface AnthropicContent {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+}
+
+interface AnthropicResponse {
+  content?: AnthropicContent[];
+  stop_reason?: string;
+}
+
 function makeTagInput(wrapperId: string, inputId: string): () => string[] {
   const wrapper = document.getElementById(wrapperId)!;
   const input = document.getElementById(inputId) as HTMLInputElement;
@@ -129,18 +142,37 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
 
   let data: AgentResponse;
   try {
-    const resp = await fetch('/api/proxy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1800,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      }),
-    });
-    const raw = await resp.json() as { content?: Array<{ type: string; text?: string }> };
+    type Message = { role: 'user' | 'assistant'; content: string | AnthropicContent[] };
+    const messages: Message[] = [{ role: 'user', content: userMsg }];
+    let raw: AnthropicResponse = {};
+
+    for (let turn = 0; turn < 5; turn++) {
+      const resp = await fetch('/api/proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1800,
+          system: systemPrompt,
+          messages,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        }),
+      });
+      raw = await resp.json() as AnthropicResponse;
+
+      if (raw.stop_reason !== 'tool_use') break;
+
+      const searches = (raw.content ?? []).filter(b => b.type === 'tool_use');
+      addLog(`Web search: ${searches.map(b => JSON.stringify((b.input as Record<string, unknown>)?.query ?? b.name)).join(', ')}`, 'search');
+
+      // Append assistant turn and empty tool results — Anthropic executes the search server-side
+      messages.push({ role: 'assistant', content: raw.content ?? [] });
+      messages.push({
+        role: 'user',
+        content: searches.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: '' })),
+      });
+    }
+
     const textBlock = raw.content?.find(b => b.type === 'text');
     if (!textBlock) throw new Error('No text in response');
     const cleaned = textBlock.text!.replace(/```json|```/g, '').trim();
@@ -196,18 +228,32 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
   });
 
   await delay(jobs.length * 120 + 400);
-  addLog('Composing daily digest email...', 'email');
-  await delay(500);
-  addLog(`Sending to celestemricci@gmail.com · Subject: "${data.email_subject ?? 'Your daily job matches'}"`, 'email');
+
+  const recipient = 'celestemricci@gmail.com';
+  const emailSubject = data.email_subject ?? 'Your daily job matches';
 
   if (data.email_body) {
     const ep = document.getElementById('email-preview')!;
-    ep.textContent = `To: celestemricci@gmail.com\nSubject: ${data.email_subject ?? 'Your daily job matches'}\n\n${data.email_body}`;
+    ep.textContent = `To: ${recipient}\nSubject: ${emailSubject}\n\n${data.email_body}`;
     (ep as HTMLElement).style.display = 'block';
   }
 
-  await delay(300);
-  addLog('✓ Email sent successfully', 'found');
+  addLog('Composing daily digest email...', 'email');
+  await delay(500);
+  addLog(`Sending to ${recipient} · Subject: "${emailSubject}"`, 'email');
+
+  try {
+    const emailResp = await fetch('/api/send-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: recipient, subject: emailSubject, text: data.email_body ?? '' }),
+    });
+    if (!emailResp.ok) throw new Error(`Status ${emailResp.status}`);
+    addLog('✓ Email sent successfully', 'found');
+  } catch (err) {
+    addLog(`Email failed: ${(err as Error).message}`, 'error');
+  }
+
   addLog('Agent run complete. Next run scheduled for tomorrow.', 'info');
 
   const statEmail = document.getElementById('stat-email')!;
