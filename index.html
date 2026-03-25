@@ -318,6 +318,16 @@
   }
   .apply-link:hover { color: var(--accent); }
 
+  /* URL verification badge */
+  .url-badge {
+    font-size: 10px; padding: 2px 6px; border-radius: 4px;
+    font-weight: 500; white-space: nowrap;
+  }
+  .url-checking { color: var(--muted); font-size: 10px; }
+  .url-ok      { background: rgba(52,211,153,0.1);  color: var(--green); border: 1px solid rgba(52,211,153,0.2); }
+  .url-blocked { background: rgba(251,191,36,0.1);  color: var(--amber); border: 1px solid rgba(251,191,36,0.2); }
+  .url-dead    { background: rgba(248,113,113,0.1); color: var(--red);   border: 1px solid rgba(248,113,113,0.2); }
+
   /* Empty state */
   .empty {
     padding: 48px 20px;

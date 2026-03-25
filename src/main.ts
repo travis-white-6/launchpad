@@ -198,7 +198,13 @@ The JSON must follow this exact structure:
   "email_body": "A friendly 150-word email digest summarizing the top matches, written to the candidate by name if provided. Use plain text, no HTML."
 }
 
-Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, Greenhouse, Lever, Workday), and realistic match scores (60–98). Mark 2–3 jobs as is_new: true. Order by match_score descending.`;
+Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, Greenhouse, Lever, Workday), and realistic match scores (60–98). Mark 2–3 jobs as is_new: true. Order by match_score descending.
+
+IMPORTANT URL rules:
+- Only include a URL if you found it directly via web search and confirmed the listing is currently open.
+- Prefer direct application URLs (Greenhouse, Lever, Workday, company careers page) over job board listing pages where possible.
+- Do not construct or guess URLs — only use URLs you have seen in search results.
+- If you cannot find a confirmed URL for a job, omit the url field entirely.`;
 
   const userMsg = `Find relevant job openings for this candidate and draft a notification email:\n\n${profileDesc}`;
 
@@ -273,6 +279,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
       const locTag = job.location ? `<span class="job-tag tag-loc">${job.location}</span>` : '';
       const typeTag = job.type ? `<span class="job-tag tag-type">${job.type}</span>` : '';
 
+      const urlBadgeId = `url-badge-${i}`;
       card.innerHTML = `
         <div>
           <div class="job-title">${job.title}</div>
@@ -283,6 +290,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
         <div class="job-score">
           <div class="score-circle ${scoreClass}">${job.match_score}%</div>
           <a class="apply-link" href="${job.url ?? '#'}" target="_blank">View ↗</a>
+          ${job.url ? `<span id="${urlBadgeId}" class="url-checking">checking…</span>` : ''}
         </div>
       `;
       list.appendChild(card);
@@ -294,6 +302,9 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
   });
 
   await delay(jobs.length * 120 + 400);
+
+  // Verify job URLs in the background — updates badges as results come in
+  void checkJobUrls(jobs);
 
   const recipient = 'celestemricci@gmail.com';
   const emailSubject = data.email_subject ?? 'Your daily job matches';
@@ -332,6 +343,45 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
   btn.disabled = false;
   spinner.style.display = 'none';
   btnLabel.textContent = '▶ Run agent now';
+}
+
+async function checkJobUrls(jobs: JobMatch[]): Promise<void> {
+  const urlsToCheck = jobs.map(j => j.url).filter((u): u is string => !!u);
+  if (urlsToCheck.length === 0) return;
+
+  let results: Record<string, string> = {};
+  try {
+    const resp = await fetch('/api/check-urls', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls: urlsToCheck }),
+    });
+    if (resp.ok) {
+      ({ results } = await resp.json() as { results: Record<string, string> });
+    }
+  } catch {
+    return; // Silently bail — URL checking is best-effort
+  }
+
+  jobs.forEach((job, i) => {
+    if (!job.url) return;
+    const badge = document.getElementById(`url-badge-${i}`);
+    if (!badge) return;
+
+    const status = results[job.url];
+    if (status === 'ok') {
+      badge.className = 'url-badge url-ok';
+      badge.textContent = '✓ Verified';
+    } else if (status === 'dead') {
+      badge.className = 'url-badge url-dead';
+      badge.textContent = '✗ May be closed';
+    } else if (status === 'blocked') {
+      badge.className = 'url-badge url-blocked';
+      badge.textContent = '~ Unverifiable';
+    } else {
+      badge.remove();
+    }
+  });
 }
 
 function delay(ms: number): Promise<void> {

