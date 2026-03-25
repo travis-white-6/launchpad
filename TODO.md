@@ -12,9 +12,5 @@
 
 ## What's still pending
 
-### 1. Mailgun setup (blocks all email functionality)
-All email code is implemented but nothing will send until Mailgun is configured:
-- [ ] Create a Mailgun account and get a real API key
-- [ ] Add a sending domain in Mailgun (e.g. `mg.traviswhite.dev`)
-- [ ] Add the required DNS records to `traviswhite.dev` (Mailgun provides the exact TXT/MX/CNAME records after you set up the domain)
-- [ ] Add `MAILGUN_API_KEY` and `MAILGUN_DOMAIN` as environment variables in Netlify
+### 1. ~~Mailgun setup~~ ✅ Done
+Mailgun account created, sending domain configured, DNS records added to `traviswhite.dev`, and `MAILGUN_API_KEY` + `MAILGUN_DOMAIN` set in Netlify.
