@@ -38,11 +38,22 @@ interface SavedProfile {
   notes?: string;
   roles?: string[];
   skills?: string[];
+  recipients?: string[];
+  lastRun?: string;
 }
 
 interface TagInput {
   get: () => string[];
   set: (values: string[]) => void;
+}
+
+interface RunRecord {
+  id: string;
+  timestamp: string;
+  type: 'manual' | 'scheduled';
+  jobCount: number;
+  status: 'success' | 'error';
+  error?: string;
 }
 
 // --- Tag inputs ---
@@ -57,7 +68,14 @@ function makeTagInput(wrapperId: string, inputId: string): TagInput {
     tags.push(val);
     const tag = document.createElement('span');
     tag.className = 'tag';
-    tag.innerHTML = `${val}<button onclick="this.parentElement.remove()">×</button>`;
+    const btn = document.createElement('button');
+    btn.textContent = '×';
+    btn.addEventListener('click', () => {
+      tag.remove();
+      const idx = tags.indexOf(val);
+      if (idx !== -1) tags.splice(idx, 1);
+    });
+    tag.append(document.createTextNode(val), btn);
     wrapper.insertBefore(tag, input);
   }
 
@@ -68,6 +86,14 @@ function makeTagInput(wrapperId: string, inputId: string): TagInput {
       addTag(val);
       input.value = '';
     }
+  });
+
+  input.addEventListener('paste', (e: ClipboardEvent) => {
+    const text = e.clipboardData?.getData('text') ?? '';
+    if (!text.includes(',')) return; // let normal paste handle single values
+    e.preventDefault();
+    text.split(',').map(s => s.trim()).filter(Boolean).forEach(addTag);
+    input.value = '';
   });
 
   return {
@@ -82,6 +108,7 @@ function makeTagInput(wrapperId: string, inputId: string): TagInput {
 
 const roles = makeTagInput('roles-wrapper', 'roles-input');
 const skills = makeTagInput('skills-wrapper', 'skills-input');
+const recipients = makeTagInput('recipients-wrapper', 'recipients-input');
 
 // --- Profile persistence ---
 
@@ -99,6 +126,10 @@ async function loadProfile(): Promise<void> {
     if (profile.notes) (document.getElementById('notes') as HTMLTextAreaElement).value = profile.notes;
     if (profile.roles?.length) roles.set(profile.roles);
     if (profile.skills?.length) skills.set(profile.skills);
+    if (profile.recipients?.length) recipients.set(profile.recipients);
+    if (profile.lastRun) {
+      document.getElementById('last-run')!.textContent = `Last run: ${new Date(profile.lastRun).toLocaleString()} · Next: tomorrow at this time`;
+    }
   } catch {
     // Ignore — form just won't be pre-filled
   }
@@ -137,14 +168,20 @@ async function runAgent(): Promise<void> {
   const notes = (document.getElementById('notes') as HTMLTextAreaElement).value.trim();
   const rolesList = roles.get();
   const skillsList = skills.get();
+  const recipientsList = recipients.get();
 
   if (!title && rolesList.length === 0) {
     alert('Please enter a current title or add at least one target role.');
     return;
   }
 
+  if (recipientsList.length === 0) {
+    alert('Please add at least one recipient email address.');
+    return;
+  }
+
   // Save profile before running so it persists for next time
-  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList });
+  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList, recipients: recipientsList });
 
   const btn = document.getElementById('run-btn') as HTMLButtonElement;
   const spinner = document.getElementById('spinner')!;
@@ -214,43 +251,30 @@ IMPORTANT URL rules:
   await delay(600);
 
   let data: AgentResponse;
+  let apiSucceeded = true;
+  let apiError = '';
   try {
-    type Message = { role: 'user' | 'assistant'; content: string | AnthropicContent[] };
-    const messages: Message[] = [{ role: 'user', content: userMsg }];
-    let raw: AnthropicResponse = {};
-
-    for (let turn = 0; turn < 5; turn++) {
-      const resp = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1800,
-          system: systemPrompt,
-          messages,
-          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        }),
-      });
-      raw = await resp.json() as AnthropicResponse;
-
-      if (raw.stop_reason !== 'tool_use') break;
-
-      const searches = (raw.content ?? []).filter(b => b.type === 'tool_use');
-      addLog(`Web search: ${searches.map(b => JSON.stringify((b.input as Record<string, unknown>)?.query ?? b.name)).join(', ')}`, 'search');
-
-      messages.push({ role: 'assistant', content: raw.content ?? [] });
-      messages.push({
-        role: 'user',
-        content: searches.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: '' })),
-      });
-    }
-
+    const resp = await fetch('/api/proxy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1800,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userMsg }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      }),
+    });
+    if (!resp.ok) throw new Error(`Proxy error ${resp.status}`);
+    const raw = await resp.json() as AnthropicResponse;
     const textBlock = raw.content?.find(b => b.type === 'text');
     if (!textBlock) throw new Error('No text in response');
     const cleaned = textBlock.text!.replace(/```json|```/g, '').trim();
     data = JSON.parse(cleaned) as AgentResponse;
   } catch (err) {
-    addLog('API error: ' + (err as Error).message, 'error');
+    apiSucceeded = false;
+    apiError = (err as Error).message;
+    addLog('API error: ' + apiError, 'error');
     addLog('Using curated fallback results for demo...', 'info');
     data = generateFallback(name, title, rolesList, skillsList, location, jobtype);
   }
@@ -306,24 +330,24 @@ IMPORTANT URL rules:
   // Verify job URLs in the background — updates badges as results come in
   void checkJobUrls(jobs);
 
-  const recipient = 'celestemricci@gmail.com';
+  const toList = recipientsList.join(', ');
   const emailSubject = data.email_subject ?? 'Your daily job matches';
 
   if (data.email_body) {
     const ep = document.getElementById('email-preview')!;
-    ep.textContent = `To: ${recipient}\nSubject: ${emailSubject}\n\n${data.email_body}`;
+    ep.textContent = `To: ${toList}\nSubject: ${emailSubject}\n\n${data.email_body}`;
     (ep as HTMLElement).style.display = 'block';
   }
 
   addLog('Composing daily digest email...', 'email');
   await delay(500);
-  addLog(`Sending to ${recipient} · Subject: "${emailSubject}"`, 'email');
+  addLog(`Sending to ${toList} · Subject: "${emailSubject}"`, 'email');
 
   try {
     const emailResp = await fetch('/api/send-email', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to: recipient, subject: emailSubject, text: data.email_body ?? '' }),
+      body: JSON.stringify({ to: toList, subject: emailSubject, text: data.email_body ?? '' }),
     });
     if (!emailResp.ok) throw new Error(`Status ${emailResp.status}`);
     addLog('✓ Email sent successfully', 'found');
@@ -337,7 +361,10 @@ IMPORTANT URL rules:
   statEmail.textContent = '✓ Sent';
   (statEmail as HTMLElement).style.color = 'var(--green)';
   document.getElementById('results-count')!.textContent = `${jobs.length} jobs`;
-  document.getElementById('last-run')!.textContent = `Last run: ${new Date().toLocaleString()} · Next: tomorrow at this time`;
+  const lastRunTs = new Date().toISOString();
+  document.getElementById('last-run')!.textContent = `Last run: ${new Date(lastRunTs).toLocaleString()} · Next: tomorrow at this time`;
+  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList, recipients: recipientsList, lastRun: lastRunTs });
+  void saveRunRecord({ id: lastRunTs, timestamp: lastRunTs, type: 'manual', jobCount: jobs.length, status: apiSucceeded ? 'success' : 'error', error: apiSucceeded ? undefined : apiError });
   document.getElementById('run-status')!.textContent = 'Done';
 
   btn.disabled = false;
@@ -411,6 +438,86 @@ function generateFallback(
   };
 }
 
+// --- Run history ---
+
+function renderRunHistory(runs: RunRecord[]): void {
+  const list = document.getElementById('run-history-list')!;
+  const count = document.getElementById('run-history-count')!;
+  count.textContent = `${runs.length} run${runs.length !== 1 ? 's' : ''}`;
+
+  if (runs.length === 0) {
+    list.innerHTML = `<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">No runs yet — configure your profile and run the agent.</div></div>`;
+    return;
+  }
+
+  list.innerHTML = '';
+  runs.forEach(run => {
+    const row = document.createElement('div');
+    row.className = 'run-row';
+    row.dataset.id = run.id;
+
+    const statusHtml = run.status === 'success'
+      ? `<span class="run-status-ok">✓ Success</span>`
+      : `<span class="run-status-error">✗ Error</span>`;
+
+    row.innerHTML = `
+      <span class="run-time">${new Date(run.timestamp).toLocaleString()}</span>
+      <span class="run-type">${run.type}</span>
+      <span class="run-jobs">${run.jobCount} job${run.jobCount !== 1 ? 's' : ''}</span>
+      ${statusHtml}
+      <button class="run-delete">Delete</button>
+    `;
+
+    row.querySelector('.run-delete')!.addEventListener('click', () => void deleteRun(run.id));
+    list.appendChild(row);
+  });
+}
+
+async function loadRunHistory(): Promise<void> {
+  try {
+    const resp = await fetch('/api/runs');
+    if (!resp.ok) return;
+    const runs = await resp.json() as RunRecord[];
+    renderRunHistory(runs);
+  } catch {
+    // Ignore — run history just won't show
+  }
+}
+
+async function saveRunRecord(run: RunRecord): Promise<void> {
+  try {
+    await fetch('/api/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(run),
+    });
+    await loadRunHistory();
+  } catch {
+    // Ignore — non-critical
+  }
+}
+
+async function deleteRun(id: string): Promise<void> {
+  try {
+    await fetch('/api/runs', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+    // Optimistically remove the row
+    document.querySelector(`.run-row[data-id="${CSS.escape(id)}"]`)?.remove();
+    const list = document.getElementById('run-history-list')!;
+    const remaining = list.querySelectorAll('.run-row').length;
+    document.getElementById('run-history-count')!.textContent = `${remaining} run${remaining !== 1 ? 's' : ''}`;
+    if (remaining === 0) {
+      list.innerHTML = `<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">No runs yet — configure your profile and run the agent.</div></div>`;
+    }
+  } catch {
+    // Ignore
+  }
+}
+
 // Load saved profile on page load, then expose runAgent globally
 loadProfile();
+loadRunHistory();
 (window as unknown as Record<string, unknown>).runAgent = runAgent;

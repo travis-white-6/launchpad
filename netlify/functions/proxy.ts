@@ -11,6 +11,17 @@ interface RateLimitResult {
   remaining: number;
 }
 
+interface AnthropicContentBlock {
+  type: string;
+  id?: string;
+}
+
+interface AnthropicApiResponse {
+  content?: AnthropicContentBlock[];
+  stop_reason?: string;
+  status?: number;
+}
+
 const rateLimitStore = new Map<string, RateLimitRecord>();
 
 const RATE_LIMIT = {
@@ -20,6 +31,7 @@ const RATE_LIMIT = {
 
 const ALLOWED_ORIGINS: string[] = [
   'https://curious-profiterole-6c8c76.netlify.app',
+  ...(process.env.NETLIFY_DEV === 'true' ? ['http://localhost:8888'] : []),
 ];
 
 function getRateLimit(ip: string): RateLimitResult {
@@ -57,9 +69,7 @@ async function sendRateLimitAlert(ip: string): Promise<void> {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: body.toString(),
-  }).catch(() => {
-    // Fire-and-forget — don't let email failure affect the 429 response
-  });
+  }).catch(() => {});
 }
 
 function cleanupStore(): void {
@@ -69,6 +79,18 @@ function cleanupStore(): void {
       rateLimitStore.delete(ip);
     }
   }
+}
+
+async function callAnthropic(payload: Record<string, unknown>): Promise<Response> {
+  return fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(payload),
+  });
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -107,43 +129,70 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  // Validate request body exists
-  let body: unknown;
+  // Validate request body
+  let body: Record<string, unknown>;
   try {
-    body = await req.json();
+    body = await req.json() as Record<string, unknown>;
   } catch {
     return new Response('Invalid JSON body', { status: 400 });
   }
 
-  // Block oversized payloads (guard against prompt stuffing)
-  const bodyStr = JSON.stringify(body);
-  if (bodyStr.length > 20_000) {
+  // Block oversized initial payloads (guard against prompt stuffing)
+  if (JSON.stringify(body).length > 20_000) {
     return new Response('Request too large', { status: 413 });
   }
 
-  // Forward to Anthropic
-  let response: Response;
-  try {
-    response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
-        'anthropic-version': '2023-06-01',
+  // Run the tool-use loop server-side so the browser makes only one request.
+  // Anthropic's web_search tool requires multi-turn: the model returns tool_use
+  // blocks, we send back tool_result blocks, and repeat until stop_reason is
+  // no longer 'tool_use'.
+  type Message = { role: string; content: unknown };
+  let messages = (body.messages as Message[]) ?? [];
+  let apiResponse: AnthropicApiResponse = {};
+  let lastStatus = 200;
+
+  for (let turn = 0; turn < 8; turn++) {
+    let anthropicResp: Response;
+    try {
+      anthropicResp = await callAnthropic({ ...body, messages });
+    } catch {
+      return new Response(
+        JSON.stringify({ error: 'Failed to reach Anthropic API' }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    lastStatus = anthropicResp.status;
+    apiResponse = await anthropicResp.json() as AnthropicApiResponse;
+
+    if (!anthropicResp.ok) {
+      return new Response(JSON.stringify(apiResponse), {
+        status: lastStatus,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (apiResponse.stop_reason !== 'tool_use') break;
+
+    const content = apiResponse.content ?? [];
+    const toolUses = content.filter(b => b.type === 'tool_use');
+
+    messages = [
+      ...messages,
+      { role: 'assistant', content },
+      {
+        role: 'user',
+        content: toolUses.map(b => ({
+          type: 'tool_result',
+          tool_use_id: b.id,
+          content: [],
+        })),
       },
-      body: bodyStr,
-    });
-  } catch {
-    return new Response(
-      JSON.stringify({ error: 'Failed to reach Anthropic API' }),
-      { status: 502, headers: { 'Content-Type': 'application/json' } }
-    );
+    ];
   }
 
-  const data = await response.json();
-
-  return Response.json(data, {
-    status: response.status,
+  return Response.json(apiResponse, {
+    status: lastStatus,
     headers: {
       'X-RateLimit-Remaining': String(remaining),
     },

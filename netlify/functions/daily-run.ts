@@ -1,4 +1,5 @@
 import { getStore } from '@netlify/blobs';
+import { appendRun } from './runs.js';
 
 interface SavedProfile {
   name?: string;
@@ -9,6 +10,7 @@ interface SavedProfile {
   notes?: string;
   roles?: string[];
   skills?: string[];
+  recipients?: string[];
 }
 
 interface AnthropicContent {
@@ -40,7 +42,6 @@ interface AgentResponse {
   email_body?: string;
 }
 
-const RECIPIENT = 'celestemricci@gmail.com';
 
 async function callAnthropic(profile: SavedProfile): Promise<AgentResponse> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -115,7 +116,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
     messages.push({ role: 'assistant', content: raw.content ?? [] });
     messages.push({
       role: 'user',
-      content: searches.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: '' })),
+      content: searches.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: [] })),
     });
   }
 
@@ -158,15 +159,33 @@ export default async (): Promise<Response> => {
     return Response.json({ ok: true, skipped: true });
   }
 
-  const data = await callAnthropic(profile);
-  await sendEmail(
-    RECIPIENT,
-    data.email_subject ?? 'Your daily job matches',
-    data.email_body ?? '',
-  );
+  if (!profile.recipients?.length) {
+    console.log('Daily run skipped: no recipients configured.');
+    return Response.json({ ok: true, skipped: true });
+  }
 
-  console.log(`Daily run complete. Sent ${data.jobs?.length ?? 0} jobs to ${RECIPIENT}.`);
-  return Response.json({ ok: true, jobs: data.jobs?.length ?? 0 });
+  const runId = new Date().toISOString();
+  const toList = profile.recipients.join(', ');
+
+  try {
+    const data = await callAnthropic(profile);
+    await sendEmail(
+      toList,
+      data.email_subject ?? 'Your daily job matches',
+      data.email_body ?? '',
+    );
+
+    const jobCount = data.jobs?.length ?? 0;
+    await appendRun({ id: runId, timestamp: runId, type: 'scheduled', jobCount, status: 'success' });
+
+    console.log(`Daily run complete. Sent ${jobCount} jobs to ${toList}.`);
+    return Response.json({ ok: true, jobs: jobCount });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('Daily run failed:', message);
+    await appendRun({ id: runId, timestamp: runId, type: 'scheduled', jobCount: 0, status: 'error', error: message });
+    return Response.json({ ok: false, error: message }, { status: 500 });
+  }
 };
 
 export const config = {

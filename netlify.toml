@@ -2,6 +2,9 @@
   command = "npm run build"
   publish = "."
 
+[functions."proxy"]
+  timeout_seconds = 30
+
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/:splat"

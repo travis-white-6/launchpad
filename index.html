@@ -328,6 +328,24 @@
   .url-blocked { background: rgba(251,191,36,0.1);  color: var(--amber); border: 1px solid rgba(251,191,36,0.2); }
   .url-dead    { background: rgba(248,113,113,0.1); color: var(--red);   border: 1px solid rgba(248,113,113,0.2); }
 
+  /* Run history */
+  .run-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .run-row:last-child { border-bottom: none; }
+  .run-time { color: var(--muted); flex: 1; }
+  .run-type { font-size: 11px; padding: 2px 7px; border-radius: 10px; background: var(--bg3); color: var(--text); font-weight: 500; }
+  .run-jobs { color: var(--text); min-width: 60px; text-align: right; }
+  .run-status-ok    { color: var(--green); font-weight: 500; }
+  .run-status-error { color: var(--red);   font-weight: 500; }
+  .run-delete {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 11px;
+  }
+  .run-delete:hover { border-color: var(--red); color: var(--red); }
+
   /* Empty state */
   .empty {
     padding: 48px 20px;
@@ -460,9 +478,11 @@
 
     <div>
       <div class="section-label">Notification</div>
-      <div class="schedule-info">
-        <span>📧</span>
-        <div>Daily digest to <strong style="color:var(--text)"><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="c8abada4adbbbcada5baa1ababa188afa5a9a1a4e6aba7a5">[email&#160;protected]</a></strong></div>
+      <div class="form-group">
+        <label>Send results to (press Enter to add)</label>
+        <div class="tag-input-wrapper" id="recipients-wrapper">
+          <input class="tag-input" id="recipients-input" type="email" placeholder="Add email..." />
+        </div>
       </div>
     </div>
 
@@ -522,6 +542,20 @@
           <div class="empty-icon">🔍</div>
           <div class="empty-title">No results yet</div>
           <div class="empty-sub">Fill in your profile and click "Run agent now"</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Run history -->
+    <div class="panel" style="margin-top:16px;">
+      <div class="panel-header">
+        <span>Run history</span>
+        <span class="badge" id="run-history-count">0 runs</span>
+      </div>
+      <div id="run-history-list">
+        <div class="empty">
+          <div class="empty-icon">📋</div>
+          <div class="empty-title">No runs yet — configure your profile and run the agent.</div>
         </div>
       </div>
     </div>
