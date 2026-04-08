@@ -1,3 +1,8 @@
+const ALLOWED_ORIGINS: string[] = [
+  'https://curious-profiterole-6c8c76.netlify.app',
+  ...(process.env.NETLIFY_DEV === 'true' ? ['http://localhost:8888'] : []),
+];
+
 async function sendViaMailgun(to: string, subject: string, text: string): Promise<void> {
   const apiKey = process.env.MAILGUN_API_KEY;
   const domain = process.env.MAILGUN_DOMAIN;
@@ -30,6 +35,11 @@ async function sendViaMailgun(to: string, subject: string, text: string): Promis
 export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
+  }
+
+  const origin = req.headers.get('origin') ?? '';
+  if (ALLOWED_ORIGINS.length > 0 && !ALLOWED_ORIGINS.includes(origin)) {
+    return new Response('Forbidden', { status: 403 });
   }
 
   let payload: { to: string; subject: string; text: string };

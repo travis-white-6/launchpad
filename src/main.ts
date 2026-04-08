@@ -1,33 +1,4 @@
-interface JobMatch {
-  title: string;
-  company: string;
-  location: string;
-  type: string;
-  match_score: number;
-  is_new: boolean;
-  skills_matched: string[];
-  url?: string;
-  reason?: string;
-}
-
-interface AgentResponse {
-  jobs: JobMatch[];
-  email_subject?: string;
-  email_body?: string;
-}
-
-interface AnthropicContent {
-  type: string;
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-}
-
-interface AnthropicResponse {
-  content?: AnthropicContent[];
-  stop_reason?: string;
-}
+import type { JobMatch, RunResult } from '../netlify/functions/run-background.js';
 
 interface SavedProfile {
   name?: string;
@@ -40,6 +11,9 @@ interface SavedProfile {
   skills?: string[];
   recipients?: string[];
   lastRun?: string;
+  dailyEnabled?: boolean;
+  paused?: boolean;
+  skipNext?: boolean;
 }
 
 interface TagInput {
@@ -90,7 +64,7 @@ function makeTagInput(wrapperId: string, inputId: string): TagInput {
 
   input.addEventListener('paste', (e: ClipboardEvent) => {
     const text = e.clipboardData?.getData('text') ?? '';
-    if (!text.includes(',')) return; // let normal paste handle single values
+    if (!text.includes(',')) return;
     e.preventDefault();
     text.split(',').map(s => s.trim()).filter(Boolean).forEach(addTag);
     input.value = '';
@@ -128,249 +102,31 @@ async function loadProfile(): Promise<void> {
     if (profile.skills?.length) skills.set(profile.skills);
     if (profile.recipients?.length) recipients.set(profile.recipients);
     if (profile.lastRun) {
-      document.getElementById('last-run')!.textContent = `Last run: ${new Date(profile.lastRun).toLocaleString()} · Next: tomorrow at this time`;
+      document.getElementById('last-run')!.textContent = `Last run: ${new Date(profile.lastRun).toLocaleString()} · Next: ${nextRunLabel()}`;
     }
   } catch {
     // Ignore — form just won't be pre-filled
   }
 }
 
-function saveProfile(profile: SavedProfile): void {
-  // Fire-and-forget — don't block the agent run
-  void fetch('/api/profile', {
+async function saveProfile(profile: SavedProfile): Promise<void> {
+  await fetch('/api/profile', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(profile),
   }).catch(() => {});
 }
 
-// --- Agent log ---
+// --- Next run label ---
 
-function addLog(msg: string, type = 'info'): void {
-  const log = document.getElementById('log')!;
+function nextRunLabel(): string {
   const now = new Date();
-  const t = now.toTimeString().slice(0, 8);
-  const line = document.createElement('div');
-  line.className = 'log-line';
-  line.innerHTML = `<span class="log-time">${t}</span><span class="log-msg ${type}">${msg}</span>`;
-  log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 9, 0, 0));
+  if (now >= next) next.setUTCDate(next.getUTCDate() + 1);
+  return next.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 }
 
-// --- Main agent run ---
-
-async function runAgent(): Promise<void> {
-  const name = (document.getElementById('name') as HTMLInputElement).value.trim();
-  const title = (document.getElementById('title') as HTMLInputElement).value.trim();
-  const experience = (document.getElementById('experience') as HTMLSelectElement).value;
-  const location = (document.getElementById('location') as HTMLSelectElement).value;
-  const jobtype = (document.getElementById('jobtype') as HTMLSelectElement).value;
-  const notes = (document.getElementById('notes') as HTMLTextAreaElement).value.trim();
-  const rolesList = roles.get();
-  const skillsList = skills.get();
-  const recipientsList = recipients.get();
-
-  if (!title && rolesList.length === 0) {
-    alert('Please enter a current title or add at least one target role.');
-    return;
-  }
-
-  if (recipientsList.length === 0) {
-    alert('Please add at least one recipient email address.');
-    return;
-  }
-
-  // Save profile before running so it persists for next time
-  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList, recipients: recipientsList });
-
-  const btn = document.getElementById('run-btn') as HTMLButtonElement;
-  const spinner = document.getElementById('spinner')!;
-  const btnLabel = document.getElementById('btn-label')!;
-  btn.disabled = true;
-  spinner.style.display = 'block';
-  btnLabel.textContent = 'Agent running...';
-  document.getElementById('run-status')!.textContent = 'Running';
-
-  document.getElementById('log')!.innerHTML = '';
-  document.getElementById('jobs-list')!.innerHTML = '';
-  (document.getElementById('email-preview') as HTMLElement).style.display = 'none';
-  document.getElementById('stat-found')!.textContent = '—';
-  document.getElementById('stat-high')!.textContent = '—';
-  document.getElementById('stat-new')!.textContent = '—';
-  document.getElementById('stat-email')!.textContent = '—';
-
-  addLog('Agent initialised', 'info');
-  addLog(`Profile: ${name || 'Candidate'} · ${title || rolesList[0] || 'TBD'} · ${experience || 'any exp'}`, 'info');
-  addLog(`Preferences: ${location || 'Any location'} · ${jobtype}`, 'info');
-
-  const profileDesc = [
-    name ? `Name: ${name}` : '',
-    title ? `Current role: ${title}` : '',
-    experience ? `Experience: ${experience}` : '',
-    rolesList.length > 0 ? `Target roles: ${rolesList.join(', ')}` : '',
-    skillsList.length > 0 ? `Skills: ${skillsList.join(', ')}` : '',
-    location ? `Location preference: ${location}` : '',
-    `Job type: ${jobtype}`,
-    notes ? `Additional notes: ${notes}` : '',
-  ].filter(Boolean).join('\n');
-
-  const systemPrompt = `You are a job sourcing agent. Given a candidate profile, you search for and identify the most relevant job opportunities. You return ONLY a valid JSON object with NO markdown, NO backticks, and NO extra text.
-
-The JSON must follow this exact structure:
-{
-  "jobs": [
-    {
-      "title": "Job title",
-      "company": "Company name",
-      "location": "City, State or Remote",
-      "type": "Full-time / Contract / etc",
-      "match_score": 92,
-      "is_new": true,
-      "skills_matched": ["skill1", "skill2"],
-      "url": "https://example.com/jobs/123",
-      "reason": "One sentence why this is a great fit"
-    }
-  ],
-  "email_subject": "Subject line for the daily digest email",
-  "email_body": "A friendly 150-word email digest summarizing the top matches, written to the candidate by name if provided. Use plain text, no HTML."
-}
-
-Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, Greenhouse, Lever, Workday), and realistic match scores (60–98). Mark 2–3 jobs as is_new: true. Order by match_score descending.
-
-IMPORTANT URL rules:
-- Only include a URL if you found it directly via web search and confirmed the listing is currently open.
-- Prefer direct application URLs (Greenhouse, Lever, Workday, company careers page) over job board listing pages where possible.
-- Do not construct or guess URLs — only use URLs you have seen in search results.
-- If you cannot find a confirmed URL for a job, omit the url field entirely.`;
-
-  const userMsg = `Find relevant job openings for this candidate and draft a notification email:\n\n${profileDesc}`;
-
-  addLog('Searching job boards: LinkedIn, Greenhouse, Lever, Workday...', 'search');
-  await delay(800);
-  addLog('Searching: Indeed, Glassdoor, Wellfound (AngelList)...', 'search');
-  await delay(600);
-
-  let data: AgentResponse;
-  let apiSucceeded = true;
-  let apiError = '';
-  try {
-    const resp = await fetch('/api/proxy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1800,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      }),
-    });
-    if (!resp.ok) throw new Error(`Proxy error ${resp.status}`);
-    const raw = await resp.json() as AnthropicResponse;
-    const textBlock = raw.content?.find(b => b.type === 'text');
-    if (!textBlock) throw new Error('No text in response');
-    const cleaned = textBlock.text!.replace(/```json|```/g, '').trim();
-    data = JSON.parse(cleaned) as AgentResponse;
-  } catch (err) {
-    apiSucceeded = false;
-    apiError = (err as Error).message;
-    addLog('API error: ' + apiError, 'error');
-    addLog('Using curated fallback results for demo...', 'info');
-    data = generateFallback(name, title, rolesList, skillsList, location, jobtype);
-  }
-
-  const jobs = data.jobs ?? [];
-  addLog(`Found ${jobs.length} matching positions`, 'found');
-  await delay(400);
-
-  const list = document.getElementById('jobs-list')!;
-  list.innerHTML = '';
-  let highCount = 0, newCount = 0;
-
-  jobs.forEach((job, i) => {
-    setTimeout(() => {
-      if (job.match_score >= 85) highCount++;
-      if (job.is_new) newCount++;
-
-      const scoreClass = job.match_score >= 85 ? 'high' : job.match_score >= 70 ? 'mid' : '';
-      const card = document.createElement('div');
-      card.className = 'job-card' + (job.is_new ? ' new' : '');
-      card.style.animationDelay = (i * 80) + 'ms';
-
-      const skillTags = (job.skills_matched ?? []).map(s =>
-        `<span class="job-tag tag-match">${s}</span>`).join('');
-      const newTag = job.is_new ? `<span class="job-tag tag-new">✦ New</span>` : '';
-      const locTag = job.location ? `<span class="job-tag tag-loc">${job.location}</span>` : '';
-      const typeTag = job.type ? `<span class="job-tag tag-type">${job.type}</span>` : '';
-
-      const urlBadgeId = `url-badge-${i}`;
-      card.innerHTML = `
-        <div>
-          <div class="job-title">${job.title}</div>
-          <div class="job-co">${job.company}</div>
-          <div class="job-tags">${newTag}${locTag}${typeTag}${skillTags}</div>
-          ${job.reason ? `<div style="font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5">${job.reason}</div>` : ''}
-        </div>
-        <div class="job-score">
-          <div class="score-circle ${scoreClass}">${job.match_score}%</div>
-          <a class="apply-link" href="${job.url ?? '#'}" target="_blank">View ↗</a>
-          ${job.url ? `<span id="${urlBadgeId}" class="url-checking">checking…</span>` : ''}
-        </div>
-      `;
-      list.appendChild(card);
-
-      document.getElementById('stat-found')!.textContent = String(i + 1);
-      document.getElementById('stat-high')!.textContent = String(highCount);
-      document.getElementById('stat-new')!.textContent = String(newCount);
-    }, i * 120);
-  });
-
-  await delay(jobs.length * 120 + 400);
-
-  // Verify job URLs in the background — updates badges as results come in
-  void checkJobUrls(jobs);
-
-  const toList = recipientsList.join(', ');
-  const emailSubject = data.email_subject ?? 'Your daily job matches';
-
-  if (data.email_body) {
-    const ep = document.getElementById('email-preview')!;
-    ep.textContent = `To: ${toList}\nSubject: ${emailSubject}\n\n${data.email_body}`;
-    (ep as HTMLElement).style.display = 'block';
-  }
-
-  addLog('Composing daily digest email...', 'email');
-  await delay(500);
-  addLog(`Sending to ${toList} · Subject: "${emailSubject}"`, 'email');
-
-  try {
-    const emailResp = await fetch('/api/send-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to: toList, subject: emailSubject, text: data.email_body ?? '' }),
-    });
-    if (!emailResp.ok) throw new Error(`Status ${emailResp.status}`);
-    addLog('✓ Email sent successfully', 'found');
-  } catch (err) {
-    addLog(`Email failed: ${(err as Error).message}`, 'error');
-  }
-
-  addLog('Agent run complete. Next run scheduled for tomorrow.', 'info');
-
-  const statEmail = document.getElementById('stat-email')!;
-  statEmail.textContent = '✓ Sent';
-  (statEmail as HTMLElement).style.color = 'var(--green)';
-  document.getElementById('results-count')!.textContent = `${jobs.length} jobs`;
-  const lastRunTs = new Date().toISOString();
-  document.getElementById('last-run')!.textContent = `Last run: ${new Date(lastRunTs).toLocaleString()} · Next: tomorrow at this time`;
-  saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList, recipients: recipientsList, lastRun: lastRunTs });
-  void saveRunRecord({ id: lastRunTs, timestamp: lastRunTs, type: 'manual', jobCount: jobs.length, status: apiSucceeded ? 'success' : 'error', error: apiSucceeded ? undefined : apiError });
-  document.getElementById('run-status')!.textContent = 'Done';
-
-  btn.disabled = false;
-  spinner.style.display = 'none';
-  btnLabel.textContent = '▶ Run agent now';
-}
+// --- Job URL verification ---
 
 async function checkJobUrls(jobs: JobMatch[]): Promise<void> {
   const urlsToCheck = jobs.map(j => j.url).filter((u): u is string => !!u);
@@ -387,7 +143,7 @@ async function checkJobUrls(jobs: JobMatch[]): Promise<void> {
       ({ results } = await resp.json() as { results: Record<string, string> });
     }
   } catch {
-    return; // Silently bail — URL checking is best-effort
+    return;
   }
 
   jobs.forEach((job, i) => {
@@ -411,31 +167,211 @@ async function checkJobUrls(jobs: JobMatch[]): Promise<void> {
   });
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
+// --- Results rendering ---
+
+function renderResults(result: RunResult): void {
+  const jobs = result.jobs ?? [];
+
+  // Hide pending message
+  document.getElementById('run-pending-msg')!.style.display = 'none';
+
+  // Job cards
+  const list = document.getElementById('jobs-list')!;
+  list.innerHTML = '';
+  let highCount = 0, newCount = 0;
+
+  if (jobs.length === 0) {
+    list.innerHTML = `<div class="empty"><div class="empty-icon">🔍</div><div class="empty-title">No jobs found</div><div class="empty-sub">Try broadening your target roles or skills.</div></div>`;
+  } else {
+    jobs.forEach((job, i) => {
+      if (job.match_score >= 85) highCount++;
+      if (job.is_new) newCount++;
+
+      const scoreClass = job.match_score >= 85 ? 'high' : job.match_score >= 70 ? 'mid' : '';
+      const card = document.createElement('div');
+      card.className = 'job-card' + (job.is_new ? ' new' : '');
+
+      const skillTags = (job.skills_matched ?? []).map(s =>
+        `<span class="job-tag tag-match">${s}</span>`).join('');
+      const newTag = job.is_new ? `<span class="job-tag tag-new">✦ New</span>` : '';
+      const locTag = job.location ? `<span class="job-tag tag-loc">${job.location}</span>` : '';
+      const typeTag = job.type ? `<span class="job-tag tag-type">${job.type}</span>` : '';
+      const urlBadgeId = `url-badge-${i}`;
+
+      card.innerHTML = `
+        <div>
+          <div class="job-title">${job.title}</div>
+          <div class="job-co">${job.company}</div>
+          <div class="job-tags">${newTag}${locTag}${typeTag}${skillTags}</div>
+          ${job.reason ? `<div style="font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5">${job.reason}</div>` : ''}
+        </div>
+        <div class="job-score">
+          <div class="score-circle ${scoreClass}">${job.match_score}%</div>
+          <a class="apply-link" href="${job.url ?? '#'}" target="_blank">View ↗</a>
+          ${job.url ? `<span id="${urlBadgeId}" class="url-checking">checking…</span>` : ''}
+        </div>
+      `;
+      list.appendChild(card);
+    });
+  }
+
+  // Stats
+  document.getElementById('stat-found')!.textContent = String(jobs.length);
+  document.getElementById('stat-high')!.textContent = String(highCount);
+  document.getElementById('stat-new')!.textContent = String(newCount);
+
+  const statEmail = document.getElementById('stat-email')!;
+  if (result.emailSent) {
+    statEmail.textContent = '✓ Sent';
+    (statEmail as HTMLElement).style.color = 'var(--green)';
+  } else {
+    statEmail.textContent = '✗ Not sent';
+    (statEmail as HTMLElement).style.color = 'var(--red)';
+  }
+
+  // Email preview
+  if (result.email_body) {
+    const ep = document.getElementById('email-preview')!;
+    const toList = recipients.get().join(', ');
+    ep.textContent = `To: ${toList}\nSubject: ${result.email_subject ?? ''}\n\n${result.email_body}`;
+    (ep as HTMLElement).style.display = 'block';
+  }
+
+  // Header
+  document.getElementById('results-count')!.textContent = `${jobs.length} jobs`;
+  document.getElementById('run-status')!.textContent = 'Done';
+  if (result.completedAt) {
+    document.getElementById('last-run')!.textContent = `Last run: ${new Date(result.completedAt).toLocaleString()} · Next: ${nextRunLabel()}`;
+  }
+
+  void loadRunHistory();
+  void loadScheduleStatus();
+
+  // Verify URLs in background
+  void checkJobUrls(jobs);
 }
 
-function generateFallback(
-  name: string,
-  title: string,
-  rolesList: string[],
-  skillsList: string[],
-  location: string,
-  jobtype: string,
-): AgentResponse {
-  const role = rolesList[0] || title || 'Product Manager';
-  const loc = location || 'Remote';
-  return {
-    email_subject: `${name || 'Hi'}, your top job matches for today`,
-    email_body: `Hi ${name || 'there'},\n\nHere are your top job matches for today:\n\n1. ${role} at Acme Corp — 95% match\n2. Senior ${role} at BuildCo — 88% match\n3. Lead ${role} at Startify — 82% match\n\nThree new listings appeared overnight. Two are marked as high-priority matches based on your skills and preferences.\n\nHappy job hunting!\n— Launchpad Agent`,
-    jobs: [
-      { title: role, company: 'Figma', location: loc, type: jobtype, match_score: 95, is_new: true, skills_matched: skillsList.slice(0, 3), url: 'https://www.figma.com/careers', reason: 'Strong alignment with your experience and target role.' },
-      { title: `Senior ${role}`, company: 'Linear', location: loc, type: jobtype, match_score: 91, is_new: false, skills_matched: skillsList.slice(0, 2), url: 'https://linear.app/careers', reason: 'Linear is hiring for this exact role; culture and stage match your notes.' },
-      { title: `Lead ${role}`, company: 'Notion', location: loc, type: jobtype, match_score: 87, is_new: true, skills_matched: skillsList.slice(0, 2), url: 'https://www.notion.so/careers', reason: "Notion's fast-growing team is a great fit for your background." },
-      { title: role, company: 'Vercel', location: loc, type: jobtype, match_score: 82, is_new: false, skills_matched: skillsList.slice(0, 1), url: 'https://vercel.com/careers', reason: 'Developer-focused company aligned with your skills.' },
-      { title: `${role} II`, company: 'Stripe', location: loc, type: jobtype, match_score: 78, is_new: false, skills_matched: skillsList.slice(0, 1), url: 'https://stripe.com/jobs', reason: 'Stripe values strong technical skills and offers excellent compensation.' },
-    ],
-  };
+function showRunError(message: string): void {
+  document.getElementById('run-pending-msg')!.style.display = 'none';
+  const list = document.getElementById('jobs-list')!;
+  list.innerHTML = `<div class="empty"><div class="empty-icon">⚠</div><div class="empty-title">Run failed</div><div class="empty-sub">${message}</div></div>`;
+  document.getElementById('run-status')!.textContent = 'Error';
+}
+
+// --- Polling ---
+
+async function pollRunStatus(runId: string): Promise<void> {
+  const startedAt = Date.now();
+  const maxAttempts = 120; // 10 minutes at 5s intervals
+  const pendingSub = document.getElementById('pending-sub')!;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    const elapsedStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    pendingSub.textContent = `Searching job boards · ${elapsedStr} elapsed`;
+
+    try {
+      const resp = await fetch(`/api/run-status?id=${encodeURIComponent(runId)}`);
+      if (!resp.ok) continue;
+
+      const result = await resp.json() as RunResult;
+
+      if (result.status === 'success') {
+        renderResults(result);
+        return;
+      }
+      if (result.status === 'error') {
+        showRunError(result.error ?? 'Agent run failed.');
+        return;
+      }
+      // 'pending' — keep polling
+    } catch {
+      // Network hiccup — keep polling
+    }
+  }
+
+  showRunError('Agent run timed out after 10 minutes. Check Netlify function logs for details.');
+}
+
+// --- Main agent run ---
+
+async function runAgent(): Promise<void> {
+  const name = (document.getElementById('name') as HTMLInputElement).value.trim();
+  const title = (document.getElementById('title') as HTMLInputElement).value.trim();
+  const experience = (document.getElementById('experience') as HTMLSelectElement).value;
+  const location = (document.getElementById('location') as HTMLSelectElement).value;
+  const jobtype = (document.getElementById('jobtype') as HTMLSelectElement).value;
+  const notes = (document.getElementById('notes') as HTMLTextAreaElement).value.trim();
+  const rolesList = roles.get();
+  const skillsList = skills.get();
+  const recipientsList = recipients.get();
+
+  if (!title && rolesList.length === 0) {
+    alert('Please enter a current title or add at least one target role.');
+    return;
+  }
+  if (recipientsList.length === 0) {
+    alert('Please add at least one recipient email address.');
+    return;
+  }
+
+  // Await profile save so the background function reads the latest data
+  await saveProfile({ name, title, experience, location, jobtype, notes, roles: rolesList, skills: skillsList, recipients: recipientsList });
+
+  const btn = document.getElementById('run-btn') as HTMLButtonElement;
+  const spinner = document.getElementById('spinner')!;
+  const btnLabel = document.getElementById('btn-label')!;
+  btn.disabled = true;
+  spinner.style.display = 'block';
+  btnLabel.textContent = 'Running…';
+  document.getElementById('run-status')!.textContent = 'Running';
+
+  // Clear previous results
+  document.getElementById('jobs-list')!.innerHTML = '';
+  (document.getElementById('email-preview') as HTMLElement).style.display = 'none';
+  document.getElementById('stat-found')!.textContent = '—';
+  document.getElementById('stat-high')!.textContent = '—';
+  document.getElementById('stat-new')!.textContent = '—';
+  document.getElementById('stat-email')!.textContent = '—';
+
+  // Show pending message
+  const pendingMsg = document.getElementById('run-pending-msg')!;
+  const pendingSub = document.getElementById('pending-sub')!;
+  pendingSub.textContent = 'Searching job boards · 0s elapsed';
+  pendingMsg.style.display = 'flex';
+
+  // Generate run ID in browser — background function uses it as the Blobs key
+  const runId = new Date().toISOString() + '-' + Math.random().toString(36).slice(2, 8);
+
+  try {
+    const resp = await fetch('/api/run-background', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runId }),
+    });
+
+    // Background functions return 202; anything else is a startup error
+    if (resp.status !== 200 && resp.status !== 202) {
+      throw new Error(`Unexpected status ${resp.status} from run-background`);
+    }
+  } catch (err) {
+    showRunError(`Failed to start agent: ${(err as Error).message}`);
+    btn.disabled = false;
+    spinner.style.display = 'none';
+    btnLabel.textContent = '▶ Run agent now';
+    return;
+  }
+
+  // Poll until done (handles its own timeout)
+  await pollRunStatus(runId);
+
+  btn.disabled = false;
+  spinner.style.display = 'none';
+  btnLabel.textContent = '▶ Run agent now';
 }
 
 // --- Run history ---
@@ -480,20 +416,7 @@ async function loadRunHistory(): Promise<void> {
     const runs = await resp.json() as RunRecord[];
     renderRunHistory(runs);
   } catch {
-    // Ignore — run history just won't show
-  }
-}
-
-async function saveRunRecord(run: RunRecord): Promise<void> {
-  try {
-    await fetch('/api/runs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(run),
-    });
-    await loadRunHistory();
-  } catch {
-    // Ignore — non-critical
+    // Ignore
   }
 }
 
@@ -504,7 +427,6 @@ async function deleteRun(id: string): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id }),
     });
-    // Optimistically remove the row
     document.querySelector(`.run-row[data-id="${CSS.escape(id)}"]`)?.remove();
     const list = document.getElementById('run-history-list')!;
     const remaining = list.querySelectorAll('.run-row').length;
@@ -517,7 +439,154 @@ async function deleteRun(id: string): Promise<void> {
   }
 }
 
-// Load saved profile on page load, then expose runAgent globally
+// --- Schedule management ---
+
+let currentProfile: SavedProfile = {};
+
+async function loadScheduleStatus(): Promise<void> {
+  try {
+    const resp = await fetch('/api/profile');
+    if (!resp.ok) return;
+    currentProfile = await resp.json() as SavedProfile;
+    renderScheduleStatus(currentProfile);
+  } catch {
+    // Ignore
+  }
+}
+
+function renderScheduleStatus(profile: SavedProfile): void {
+  const recipientsEl = document.getElementById('sched-recipients')!;
+  const statusEl = document.getElementById('sched-status')!;
+  const pauseBtn = document.getElementById('pause-btn') as HTMLButtonElement;
+  const skipBtn = document.getElementById('skip-btn') as HTMLButtonElement;
+  const schedActions = document.getElementById('sched-actions')!;
+  const dailyBtn = document.getElementById('daily-btn') as HTMLButtonElement;
+
+  // Recipients
+  recipientsEl.innerHTML = '';
+  if (profile.recipients?.length) {
+    profile.recipients.forEach(r => {
+      const chip = document.createElement('span');
+      chip.className = 'sched-email';
+      const label = document.createTextNode(r);
+      const btn = document.createElement('button');
+      btn.className = 'sched-email-remove';
+      btn.textContent = '×';
+      btn.title = `Remove ${r}`;
+      btn.addEventListener('click', () => void removeRecipient(r));
+      chip.append(label, btn);
+      recipientsEl.appendChild(chip);
+    });
+  } else {
+    recipientsEl.innerHTML = `<span style="color:var(--muted);font-size:12px">No recipients configured — add emails in the sidebar.</span>`;
+  }
+
+  // Schedule status + actions depend on dailyEnabled state
+  if (!profile.dailyEnabled) {
+    statusEl.innerHTML = `<span class="sched-badge inactive">○ Not scheduled</span> Click "Get daily email" to enable 9 AM UTC runs.`;
+    schedActions.style.display = 'none';
+    dailyBtn.textContent = '📅 Get daily email';
+    dailyBtn.className = 'daily-btn';
+  } else if (profile.paused) {
+    statusEl.innerHTML = `<span class="sched-badge paused">⏸ Paused</span> Daily emails are suspended.`;
+    schedActions.style.display = 'flex';
+    pauseBtn.textContent = '▶ Resume';
+    pauseBtn.dataset.action = 'resume';
+    skipBtn.disabled = true;
+    dailyBtn.textContent = '✓ Daily email on';
+    dailyBtn.className = 'daily-btn active';
+  } else if (profile.skipNext) {
+    statusEl.innerHTML = `<span class="sched-badge skip">⏭ Skipping next run</span> Next: ${nextRunLabel()}.`;
+    schedActions.style.display = 'flex';
+    pauseBtn.textContent = '⏸ Pause';
+    pauseBtn.dataset.action = 'pause';
+    skipBtn.disabled = true;
+    dailyBtn.textContent = '✓ Daily email on';
+    dailyBtn.className = 'daily-btn active';
+  } else {
+    statusEl.innerHTML = `<span class="sched-badge active">● Active</span> Next run: ${nextRunLabel()}.`;
+    schedActions.style.display = 'flex';
+    pauseBtn.textContent = '⏸ Pause';
+    pauseBtn.dataset.action = 'pause';
+    skipBtn.disabled = false;
+    dailyBtn.textContent = '✓ Daily email on';
+    dailyBtn.className = 'daily-btn active';
+  }
+}
+
+async function enableDailyEmail(): Promise<void> {
+  const btn = document.getElementById('daily-btn') as HTMLButtonElement;
+  btn.disabled = true;
+  try {
+    const updated = { ...currentProfile, dailyEnabled: true, paused: false, skipNext: false };
+    await fetch('/api/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updated),
+    });
+    currentProfile = updated;
+    renderScheduleStatus(currentProfile);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function removeRecipient(email: string): Promise<void> {
+  const updated = { ...currentProfile, recipients: (currentProfile.recipients ?? []).filter(r => r !== email) };
+  await fetch('/api/profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updated),
+  });
+  currentProfile = updated;
+  recipients.set(updated.recipients ?? []);
+  renderScheduleStatus(currentProfile);
+}
+
+async function togglePause(): Promise<void> {
+  const btn = document.getElementById('pause-btn') as HTMLButtonElement;
+  const action = btn.dataset.action ?? 'pause';
+  const newPaused = action === 'pause';
+
+  btn.disabled = true;
+  try {
+    const updated = { ...currentProfile, paused: newPaused, skipNext: false };
+    await fetch('/api/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updated),
+    });
+    currentProfile = updated;
+    renderScheduleStatus(currentProfile);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function skipNextRun(): Promise<void> {
+  const btn = document.getElementById('skip-btn') as HTMLButtonElement;
+  btn.disabled = true;
+  try {
+    const updated = { ...currentProfile, skipNext: true };
+    await fetch('/api/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updated),
+    });
+    currentProfile = updated;
+    renderScheduleStatus(currentProfile);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --- Boot ---
+
 loadProfile();
 loadRunHistory();
+loadScheduleStatus();
+
 (window as unknown as Record<string, unknown>).runAgent = runAgent;
+(window as unknown as Record<string, unknown>).enableDailyEmail = enableDailyEmail;
+(window as unknown as Record<string, unknown>).togglePause = togglePause;
+(window as unknown as Record<string, unknown>).skipNextRun = skipNextRun;

@@ -11,6 +11,9 @@ interface SavedProfile {
   roles?: string[];
   skills?: string[];
   recipients?: string[];
+  dailyEnabled?: boolean;
+  paused?: boolean;
+  skipNext?: boolean;
 }
 
 interface AnthropicContent {
@@ -96,7 +99,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 1800,
         system: systemPrompt,
         messages,
@@ -156,12 +159,29 @@ export default async (): Promise<Response> => {
 
   if (!profile || (!profile.title && !profile.roles?.length)) {
     console.log('Daily run skipped: no profile saved yet.');
-    return Response.json({ ok: true, skipped: true });
+    return Response.json({ ok: true, skipped: true, reason: 'no-profile' });
+  }
+
+  if (!profile.dailyEnabled) {
+    console.log('Daily run skipped: daily emails not enabled by user.');
+    return Response.json({ ok: true, skipped: true, reason: 'not-enabled' });
   }
 
   if (!profile.recipients?.length) {
     console.log('Daily run skipped: no recipients configured.');
-    return Response.json({ ok: true, skipped: true });
+    return Response.json({ ok: true, skipped: true, reason: 'no-recipients' });
+  }
+
+  if (profile.paused) {
+    console.log('Daily run skipped: schedule is paused.');
+    return Response.json({ ok: true, skipped: true, reason: 'paused' });
+  }
+
+  if (profile.skipNext) {
+    // Clear the flag so subsequent runs proceed normally
+    await store.setJSON('candidate-profile', { ...profile, skipNext: false });
+    console.log('Daily run skipped: skip-next flag was set.');
+    return Response.json({ ok: true, skipped: true, reason: 'skip-next' });
   }
 
   const runId = new Date().toISOString();

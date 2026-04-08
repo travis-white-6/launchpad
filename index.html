@@ -167,6 +167,28 @@
   .run-btn:active { transform: scale(0.98); }
   .run-btn:disabled { background: #3a3850; color: var(--muted); cursor: not-allowed; transform: none; }
 
+  .daily-btn {
+    background: none;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 8px;
+    padding: 11px 16px;
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    width: 100%;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .daily-btn:hover { background: var(--accent-glow); }
+  .daily-btn.active { border-color: var(--green); color: var(--green); }
+  .daily-btn.active:hover { background: rgba(52,211,153,0.08); }
+  .daily-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
   /* Schedule badge */
   .schedule-info {
     background: var(--bg3);
@@ -243,25 +265,23 @@
     padding: 2px 8px;
   }
 
-  /* Thinking / log stream */
-  .log-stream {
-    padding: 16px 20px;
-    font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1.8;
-    color: var(--muted);
-    min-height: 80px;
-    max-height: 220px;
-    overflow-y: auto;
+  /* Pending / running state */
+  .run-pending {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 20px;
     border-bottom: 1px solid var(--border);
   }
-  .log-line { display: flex; gap: 10px; }
-  .log-time { color: #3d3a55; min-width: 60px; }
-  .log-msg.info { color: #8b87c0; }
-  .log-msg.search { color: var(--accent); }
-  .log-msg.found { color: var(--green); }
-  .log-msg.email { color: var(--amber); }
-  .log-msg.error { color: var(--red); }
+  .pending-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .pending-title { font-size: 14px; font-weight: 500; margin-bottom: 3px; }
+  .pending-sub { font-size: 12px; color: var(--muted); }
 
   /* Job cards */
   .jobs-list { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
@@ -388,6 +408,93 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   select.form-control option { background: #1e1e28; }
+
+  /* Schedule panel */
+  .sched-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .sched-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .sched-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .sched-recipients {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .sched-email {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    padding: 3px 8px 3px 10px;
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--text);
+  }
+  .sched-email-remove {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+  }
+  .sched-email-remove:hover { color: var(--red); }
+  .sched-status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .sched-badge {
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 20px;
+    padding: 3px 10px;
+    white-space: nowrap;
+  }
+  .sched-badge.active   { background: rgba(52,211,153,0.1);  color: var(--green); border: 1px solid rgba(52,211,153,0.2); }
+  .sched-badge.paused   { background: rgba(251,191,36,0.1);  color: var(--amber); border: 1px solid rgba(251,191,36,0.2); }
+  .sched-badge.skip     { background: rgba(124,106,247,0.1); color: #c4bcff;      border: 1px solid rgba(124,106,247,0.2); }
+  .sched-badge.inactive { background: rgba(122,120,144,0.1); color: var(--muted); border: 1px solid rgba(122,120,144,0.2); }
+  .sched-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sched-btn {
+    background: none;
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-family: var(--sans);
+    color: var(--text);
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .sched-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .sched-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .sched-btn.danger:hover { border-color: var(--amber); color: var(--amber); }
 </style>
 </head>
 <body>
@@ -486,10 +593,15 @@
       </div>
     </div>
 
-    <button class="run-btn" id="run-btn" onclick="runAgent()">
-      <div class="spinner" id="spinner"></div>
-      <span id="btn-label">▶ Run agent now</span>
-    </button>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button class="run-btn" id="run-btn" onclick="runAgent()">
+        <div class="spinner" id="spinner"></div>
+        <span id="btn-label">▶ Run agent now</span>
+      </button>
+      <button class="daily-btn" id="daily-btn" onclick="enableDailyEmail()">
+        📅 Get daily email
+      </button>
+    </div>
   </aside>
 
   <!-- Main -->
@@ -498,6 +610,25 @@
       <div>
         <div class="main-title">Job matches</div>
         <div class="main-sub" id="last-run">No runs yet — configure your profile and run the agent.</div>
+      </div>
+    </div>
+
+    <!-- Schedule & Recipients -->
+    <div class="sched-panel">
+      <div>
+        <div class="sched-label">Recipients</div>
+        <div class="sched-recipients" id="sched-recipients">
+          <span style="color:var(--muted);font-size:12px">Loading...</span>
+        </div>
+      </div>
+      <div class="sched-row">
+        <div class="sched-status-row" id="sched-status">
+          <span class="sched-badge active">● Active</span> Runs daily at 9:00 AM UTC.
+        </div>
+        <div class="sched-actions" id="sched-actions">
+          <button class="sched-btn danger" id="skip-btn" onclick="skipNextRun()" title="Skip the next scheduled daily run">⏭ Skip next run</button>
+          <button class="sched-btn" id="pause-btn" data-action="pause" onclick="togglePause()">⏸ Pause</button>
+        </div>
       </div>
     </div>
 
@@ -521,22 +652,29 @@
       </div>
     </div>
 
-    <!-- Agent log -->
+    <!-- Results panel -->
     <div class="panel">
       <div class="panel-header">
-        <span>Agent log</span>
-        <span class="badge" id="run-status">Idle</span>
+        <span>Results</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="badge" id="results-count">0 jobs</span>
+          <span class="badge" id="run-status">Idle</span>
+        </div>
       </div>
-      <div class="log-stream" id="log"></div>
+
+      <!-- Running state -->
+      <div class="run-pending" id="run-pending-msg" style="display:none">
+        <div class="pending-dot"></div>
+        <div>
+          <div class="pending-title">Agent running in background</div>
+          <div class="pending-sub" id="pending-sub">Searching job boards · 0s elapsed</div>
+        </div>
+      </div>
 
       <!-- Email preview -->
       <div class="email-preview" id="email-preview"></div>
 
-      <!-- Jobs -->
-      <div class="panel-header" style="border-top: 1px solid var(--border); border-bottom:none;">
-        <span>Results</span>
-        <span class="badge" id="results-count">0 jobs</span>
-      </div>
+      <!-- Job cards -->
       <div class="jobs-list" id="jobs-list">
         <div class="empty">
           <div class="empty-icon">🔍</div>
