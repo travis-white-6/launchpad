@@ -1,5 +1,6 @@
 import { getStore } from '@netlify/blobs';
 import { appendRun } from './runs.js';
+import { ANTHROPIC_API_KEY, MAILGUN_API_KEY, MAILGUN_DOMAIN, tryParseJson } from './_config.js';
 
 interface SavedProfile {
   name?: string;
@@ -45,10 +46,8 @@ interface AgentResponse {
   email_body?: string;
 }
 
-
 async function callAnthropic(profile: SavedProfile): Promise<AgentResponse> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+  const apiKey = ANTHROPIC_API_KEY();
 
   const profileDesc = [
     profile.name ? `Name: ${profile.name}` : '',
@@ -61,7 +60,7 @@ async function callAnthropic(profile: SavedProfile): Promise<AgentResponse> {
     profile.notes ? `Additional notes: ${profile.notes}` : '',
   ].filter(Boolean).join('\n');
 
-  const systemPrompt = `You are a job sourcing agent. Given a candidate profile, you search for and identify the most relevant job opportunities. You return ONLY a valid JSON object with NO markdown, NO backticks, and NO extra text.
+  const systemPrompt = `You are a job sourcing agent. Given a candidate profile, search the web for currently open job listings and identify the most relevant opportunities. Return ONLY a valid JSON object with NO markdown, NO backticks, and NO extra text.
 
 The JSON must follow this exact structure:
 {
@@ -78,13 +77,28 @@ The JSON must follow this exact structure:
       "reason": "One sentence why this is a great fit"
     }
   ],
-  "email_subject": "Subject line for the daily digest email",
-  "email_body": "A friendly 150-word email digest summarizing the top matches, written to the candidate by name if provided. Use plain text, no HTML."
+  "email_subject": "unused — will be overridden server-side",
+  "email_body": "A friendly daily email digest listing each job with its title, company, and direct application URL on its own line. Written to the candidate by name if provided. Plain text, no HTML, under 200 words. Do not use language like 'this week' or 'weekly' — this is a daily digest."
 }
 
-Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, Greenhouse, Lever, Workday), and realistic match scores (60–98). Mark 2–3 jobs as is_new: true. Order by match_score descending.`;
+Return 4–8 jobs. Use real company names and real job boards. Mark 2–3 as is_new: true. Order by match_score descending.
 
-  const userMsg = `Find relevant job openings for this candidate and draft a notification email:\n\n${profileDesc}`;
+IMPORTANT recency rules — a stale listing is worse than no listing:
+- Only include jobs posted within the last 30 days. Check the posting date shown in search results before including any job.
+- When searching, use date-limiting terms such as "posted this week", "last 30 days", or the job board's built-in recency filters.
+- If a search snippet does not show a posting date, search again specifically for that role at that company to confirm it is currently open.
+- Discard any listing where the posting date is older than 30 days or cannot be confirmed.
+- Before finalising each URL, check that the search result does not contain phrases like "this job has been removed", "position filled", or "no longer available". If any such signal is present, skip that listing.
+
+IMPORTANT URL rules:
+- Every job MUST include a url field — use web search to find the direct application link for each listing.
+- The URL must link to the specific job posting, not a generic careers listing page. A valid URL will contain a job-specific identifier such as a query parameter (e.g. ?gh_jid=1234567, ?lever-origin=applied, ?jobId=12345) or a path segment that uniquely identifies the role (e.g. /jobs/senior-engineer-12345). A URL that ends at the careers index (e.g. /careers or /careers-list/ with no job ID) is NOT acceptable.
+- Prefer Greenhouse, Lever, Workday, or the company's own ATS over aggregators like LinkedIn or Indeed.
+- Only include URLs you confirmed via web search — do not construct or guess URLs.
+- If you cannot find the specific job posting URL (with a job ID), use the company's generic careers page URL as a last resort — it is better than nothing.
+- The url field is REQUIRED — do not omit it.`;
+
+  const userMsg = `Search for currently open job listings for this candidate and draft a digest email:\n\n${profileDesc}`;
 
   type Message = { role: 'user' | 'assistant'; content: string | AnthropicContent[] };
   const messages: Message[] = [{ role: 'user', content: userMsg }];
@@ -100,7 +114,7 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 1800,
+        max_tokens: 4096,
         system: systemPrompt,
         messages,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
@@ -126,17 +140,56 @@ Return 4–8 jobs. Use realistic company names, realistic job boards (LinkedIn, 
   const textBlock = raw.content?.find(b => b.type === 'text');
   if (!textBlock?.text) throw new Error('No text block in Anthropic response');
 
-  const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
-  return JSON.parse(cleaned) as AgentResponse;
+  const parsed = tryParseJson<AgentResponse>(textBlock.text);
+  if (parsed) return parsed;
+
+  console.warn('[daily-run] Response not valid JSON — sending correction turn');
+  messages.push({ role: 'assistant', content: raw.content ?? [] });
+  messages.push({
+    role: 'user',
+    content: 'Your response was not valid JSON. Output ONLY the JSON object described in the system prompt — no prose, no explanation, no markdown.',
+  });
+
+  const correctionResp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages,
+    }),
+  });
+
+  if (!correctionResp.ok) {
+    const detail = await correctionResp.text();
+    throw new Error(`Anthropic correction error ${correctionResp.status}: ${detail}`);
+  }
+
+  const correctionRaw = await correctionResp.json() as AnthropicResponse;
+  const correctionText = correctionRaw.content?.find(b => b.type === 'text')?.text ?? '';
+  const corrected = tryParseJson<AgentResponse>(correctionText);
+  if (corrected) return corrected;
+
+  throw new Error(`Response not valid JSON after correction. Preview: ${textBlock.text.slice(0, 120)}`);
 }
 
 async function sendEmail(to: string, subject: string, text: string): Promise<void> {
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  if (!apiKey || !domain) throw new Error('Mailgun not configured');
+  const apiKey = MAILGUN_API_KEY();
+  const domain = MAILGUN_DOMAIN();
 
   const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
-  const body = new URLSearchParams({ from: `Launchpad <noreply@${domain}>`, to, cc: 'travis.lee.white.6@gmail.com', subject, text });
+  const body = new URLSearchParams({
+    from: `Launchpad <noreply@${domain}>`,
+    to,
+    cc: 'travis.lee.white.6@gmail.com',
+    subject,
+    text,
+  });
 
   const resp = await fetch(`https://api.mailgun.net/v3/${domain}/messages`, {
     method: 'POST',
@@ -178,7 +231,6 @@ export default async (): Promise<Response> => {
   }
 
   if (profile.skipNext) {
-    // Clear the flag so subsequent runs proceed normally
     await store.setJSON('candidate-profile', { ...profile, skipNext: false });
     console.log('Daily run skipped: skip-next flag was set.');
     return Response.json({ ok: true, skipped: true, reason: 'skip-next' });
@@ -189,13 +241,10 @@ export default async (): Promise<Response> => {
 
   try {
     const data = await callAnthropic(profile);
-    await sendEmail(
-      toList,
-      data.email_subject ?? 'Your daily job matches',
-      data.email_body ?? '',
-    );
-
     const jobCount = data.jobs?.length ?? 0;
+    const subject = `${jobCount} job match${jobCount !== 1 ? 'es' : ''} for you today`;
+    await sendEmail(toList, subject, data.email_body ?? '');
+
     await appendRun({ id: runId, timestamp: runId, type: 'scheduled', jobCount, status: 'success' });
 
     console.log(`Daily run complete. Sent ${jobCount} jobs to ${toList}.`);

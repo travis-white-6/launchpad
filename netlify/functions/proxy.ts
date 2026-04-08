@@ -1,6 +1,8 @@
 // In-memory rate limit store (resets when function instance recycles, ~few minutes)
 // For production, replace with Netlify KV or Upstash Redis
 
+import { ALLOWED_ORIGINS, ANTHROPIC_API_KEY, MAILGUN_API_KEY, MAILGUN_DOMAIN } from './_config.js';
+
 interface RateLimitRecord {
   windowStart: number;
   count: number;
@@ -29,11 +31,6 @@ const RATE_LIMIT = {
   maxRequests: 5,        // max requests per IP per window
 } as const;
 
-const ALLOWED_ORIGINS: string[] = [
-  'https://curious-profiterole-6c8c76.netlify.app',
-  ...(process.env.NETLIFY_DEV === 'true' ? ['http://localhost:8888'] : []),
-];
-
 function getRateLimit(ip: string): RateLimitResult {
   const now = Date.now();
   const record = rateLimitStore.get(ip);
@@ -50,9 +47,8 @@ function getRateLimit(ip: string): RateLimitResult {
 }
 
 async function sendRateLimitAlert(ip: string): Promise<void> {
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  if (!apiKey || !domain) return;
+  let apiKey: string, domain: string;
+  try { apiKey = MAILGUN_API_KEY(); domain = MAILGUN_DOMAIN(); } catch { return; }
 
   const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
   const body = new URLSearchParams({
@@ -86,7 +82,7 @@ async function callAnthropic(payload: Record<string, unknown>): Promise<Response
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'x-api-key': ANTHROPIC_API_KEY(),
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(payload),

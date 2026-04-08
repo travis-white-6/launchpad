@@ -1,12 +1,8 @@
-const ALLOWED_ORIGINS: string[] = [
-  'https://curious-profiterole-6c8c76.netlify.app',
-  ...(process.env.NETLIFY_DEV === 'true' ? ['http://localhost:8888'] : []),
-];
+import { ALLOWED_ORIGINS, MAILGUN_API_KEY, MAILGUN_DOMAIN } from './_config.js';
 
 async function sendViaMailgun(to: string, subject: string, text: string): Promise<void> {
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  if (!apiKey || !domain) throw new Error('Mailgun not configured (missing MAILGUN_API_KEY or MAILGUN_DOMAIN)');
+  const apiKey = MAILGUN_API_KEY();
+  const domain = MAILGUN_DOMAIN();
 
   const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
   const body = new URLSearchParams({

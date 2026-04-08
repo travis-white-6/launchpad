@@ -4,12 +4,7 @@
 
 import { getStore } from '@netlify/blobs';
 import { appendRun } from './runs.js';
-
-// --- Origin allow-list ---
-const ALLOWED_ORIGINS: string[] = [
-  'https://curious-profiterole-6c8c76.netlify.app',
-  ...(process.env.NETLIFY_DEV === 'true' ? ['http://localhost:8888'] : []),
-];
+import { ALLOWED_ORIGINS, ANTHROPIC_API_KEY, MAILGUN_API_KEY, MAILGUN_DOMAIN, tryParseJson } from './_config.js';
 
 // --- In-memory rate limit (resets when function instance recycles) ---
 interface RateLimitRecord { windowStart: number; count: number; }
@@ -90,8 +85,7 @@ export interface RunResult {
 }
 
 async function callAnthropic(profile: SavedProfile): Promise<AgentResponse> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+  const apiKey = ANTHROPIC_API_KEY();
 
   const profileDesc = [
     profile.name ? `Name: ${profile.name}` : '',
@@ -121,17 +115,26 @@ The JSON must follow this exact structure:
       "reason": "One sentence why this is a great fit"
     }
   ],
-  "email_subject": "Subject line for the daily digest email",
-  "email_body": "A friendly 150-word email digest summarizing the top matches, written to the candidate by name if provided. Use plain text, no HTML."
+  "email_subject": "unused — will be overridden server-side",
+  "email_body": "A friendly daily email digest listing each job with its title, company, and direct application URL on its own line. Written to the candidate by name if provided. Plain text, no HTML, under 200 words. Do not use language like 'this week' or 'weekly' — this is a daily digest."
 }
 
 Return 4–8 jobs. Use real company names and real job boards. Mark 2–3 as is_new: true. Order by match_score descending.
 
+IMPORTANT recency rules — a stale listing is worse than no listing:
+- Only include jobs posted within the last 30 days. Check the posting date shown in search results before including any job.
+- When searching, use date-limiting terms such as "posted this week", "last 30 days", or the job board's built-in recency filters.
+- If a search snippet does not show a posting date, search again specifically for that role at that company to confirm it is currently open.
+- Discard any listing where the posting date is older than 30 days or cannot be confirmed.
+- Before finalising each URL, check that the search result does not contain phrases like "this job has been removed", "position filled", or "no longer available". If any such signal is present, skip that listing.
+
 IMPORTANT URL rules:
-- Only include a URL if you found it directly via web search and confirmed the listing is currently open.
-- Prefer direct application URLs (Greenhouse, Lever, Workday, company careers page) over aggregator pages.
-- Do not construct or guess URLs — only use URLs you have seen in search results.
-- If you cannot confirm a URL, omit the url field entirely.`;
+- Every job MUST include a url field — use web search to find the direct application link for each listing.
+- The URL must link to the specific job posting, not a generic careers listing page. A valid URL will contain a job-specific identifier such as a query parameter (e.g. ?gh_jid=1234567, ?lever-origin=applied, ?jobId=12345) or a path segment that uniquely identifies the role (e.g. /jobs/senior-engineer-12345). A URL that ends at the careers index (e.g. /careers or /careers-list/ with no job ID) is NOT acceptable.
+- Prefer Greenhouse, Lever, Workday, or the company's own ATS over aggregators like LinkedIn or Indeed.
+- Only include URLs you confirmed via web search — do not construct or guess URLs.
+- If you cannot find the specific job posting URL (with a job ID), use the company's generic careers page URL as a last resort — it is better than nothing.
+- The url field is REQUIRED — do not omit it.`;
 
   const userMsg = `Search for currently open job listings for this candidate and draft a digest email:\n\n${profileDesc}`;
 
@@ -176,14 +179,49 @@ IMPORTANT URL rules:
   const textBlock = raw.content?.find(b => b.type === 'text');
   if (!textBlock?.text) throw new Error('No text block in Anthropic response');
 
-  const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
-  return JSON.parse(cleaned) as AgentResponse;
+  // Try to parse JSON — if Claude wrapped its answer in prose, extract the object.
+  // If that still fails, send a correction turn and try once more.
+  const parsed = tryParseJson<AgentResponse>(textBlock.text);
+  if (parsed) return parsed;
+
+  console.warn('[callAnthropic] Response was not valid JSON — sending correction turn');
+  messages.push({ role: 'assistant', content: raw.content ?? [] });
+  messages.push({
+    role: 'user',
+    content: 'Your response was not valid JSON. Output ONLY the JSON object described in the system prompt — no prose, no explanation, no markdown.',
+  });
+
+  const correctionResp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages,
+    }),
+  });
+
+  if (!correctionResp.ok) {
+    const detail = await correctionResp.text();
+    throw new Error(`Anthropic correction error ${correctionResp.status}: ${detail}`);
+  }
+
+  const correctionRaw = await correctionResp.json() as AnthropicResponse;
+  const correctionText = correctionRaw.content?.find(b => b.type === 'text')?.text ?? '';
+  const corrected = tryParseJson<AgentResponse>(correctionText);
+  if (corrected) return corrected;
+
+  throw new Error(`Response is not valid JSON after correction. Preview: ${textBlock.text.slice(0, 120)}`);
 }
 
 async function sendEmail(to: string, subject: string, text: string): Promise<void> {
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  if (!apiKey || !domain) throw new Error('Mailgun not configured');
+  const apiKey = MAILGUN_API_KEY();
+  const domain = MAILGUN_DOMAIN();
 
   const credentials = Buffer.from(`api:${apiKey}`).toString('base64');
   const body = new URLSearchParams({
@@ -214,13 +252,11 @@ export default async (req: Request): Promise<Response> => {
     return new Response('Method not allowed', { status: 405 });
   }
 
-  // Origin check
   const origin = req.headers.get('origin') ?? '';
   if (ALLOWED_ORIGINS.length > 0 && !ALLOWED_ORIGINS.includes(origin)) {
     return new Response('Forbidden', { status: 403 });
   }
 
-  // Rate limit by IP
   const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim()
     ?? req.headers.get('x-nf-client-connection-ip')
     ?? 'unknown';
@@ -237,7 +273,6 @@ export default async (req: Request): Promise<Response> => {
     return new Response('Invalid body — expected { runId: string }', { status: 400 });
   }
 
-  // Sanitize runId before using it as a Blobs key
   if (!VALID_RUN_ID.test(runId)) {
     return new Response('Invalid runId format', { status: 400 });
   }
@@ -245,7 +280,6 @@ export default async (req: Request): Promise<Response> => {
   const store = getStore('launchpad');
   const startedAt = new Date().toISOString();
 
-  // Write pending state immediately so the poller gets a response on first poll
   await store.setJSON(`run-result:${runId}`, { status: 'pending', runId, startedAt } satisfies RunResult);
 
   const profile = await store.get('candidate-profile', { type: 'json' }) as SavedProfile | null;
@@ -274,11 +308,14 @@ export default async (req: Request): Promise<Response> => {
     const data = await callAnthropic(profile);
     console.log(`[run:${runId}] Got ${data.jobs.length} jobs`);
 
+    const jobCount = data.jobs.length;
+    const subject = `${jobCount} job match${jobCount !== 1 ? 'es' : ''} for you today`;
+
     let emailSent = false;
     if (data.email_body) {
       const toList = profile.recipients.join(', ');
       try {
-        await sendEmail(toList, data.email_subject ?? 'Your daily job matches', data.email_body);
+        await sendEmail(toList, subject, data.email_body);
         emailSent = true;
         console.log(`[run:${runId}] Email sent to ${toList}`);
       } catch (emailErr) {
@@ -291,12 +328,9 @@ export default async (req: Request): Promise<Response> => {
     const completedAt = new Date().toISOString();
 
     await store.setJSON(`run-result:${runId}`, {
-      status: 'success',
-      runId,
-      startedAt,
-      completedAt,
+      status: 'success', runId, startedAt, completedAt,
       jobs: data.jobs,
-      email_subject: data.email_subject,
+      email_subject: subject,
       email_body: data.email_body,
       emailSent,
     } satisfies RunResult);
@@ -310,9 +344,7 @@ export default async (req: Request): Promise<Response> => {
     console.error(`[run:${runId}] Failed: ${message}`);
 
     await store.setJSON(`run-result:${runId}`, {
-      status: 'error',
-      runId,
-      startedAt,
+      status: 'error', runId, startedAt,
       completedAt: new Date().toISOString(),
       error: message,
     } satisfies RunResult);
