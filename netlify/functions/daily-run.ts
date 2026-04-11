@@ -104,7 +104,7 @@ IMPORTANT URL rules:
   const messages: Message[] = [{ role: 'user', content: userMsg }];
   let raw: AnthropicResponse = {};
 
-  for (let turn = 0; turn < 5; turn++) {
+  for (let turn = 0; turn < 10; turn++) {
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -117,7 +117,10 @@ IMPORTANT URL rules:
         max_tokens: 4096,
         system: systemPrompt,
         messages,
-        tools: [{ type: 'web_search_20260209', name: 'web_search' }],
+        tools: [
+          { type: 'web_search_20260209', name: 'web_search' },
+          { type: 'code_execution_20250522', name: 'code_execution' },
+        ],
       }),
     });
 
@@ -127,14 +130,30 @@ IMPORTANT URL rules:
     }
 
     raw = await resp.json() as AnthropicResponse;
-    if (raw.stop_reason !== 'tool_use') break;
 
-    const searches = (raw.content ?? []).filter(b => b.type === 'tool_use');
-    messages.push({ role: 'assistant', content: raw.content ?? [] });
-    messages.push({
-      role: 'user',
-      content: searches.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: [] })),
-    });
+    // With the new tooling, server-side tools (web_search, code_execution) use
+    // stop_reason "end_turn" — the API handles the tool loop internally.
+    // Client-side tool_use blocks (stop_reason "tool_use") are not expected here
+    // but we handle them defensively for forward-compatibility.
+    if (raw.stop_reason === 'end_turn') break;
+
+    if (raw.stop_reason === 'tool_use') {
+      // Shouldn't happen with server-side-only tools, but handle gracefully
+      const toolUseBlocks = (raw.content ?? []).filter(b => b.type === 'tool_use');
+      messages.push({ role: 'assistant', content: raw.content ?? [] });
+      messages.push({
+        role: 'user',
+        content: toolUseBlocks.map(b => ({
+          type: 'tool_result',
+          tool_use_id: b.id,
+          content: [],
+        })),
+      });
+      continue;
+    }
+
+    // Any other stop reason (e.g. max_tokens) — break and attempt to parse
+    break;
   }
 
   const textBlock = raw.content?.find(b => b.type === 'text');
