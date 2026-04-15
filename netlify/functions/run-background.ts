@@ -335,7 +335,7 @@ export default async (req: Request): Promise<Response> => {
       emailSent,
     } satisfies RunResult);
 
-    await appendRun({ id: runId, timestamp: runId, type: 'manual', jobCount: data.jobs.length, status: 'success' });
+    await appendRun({ id: runId, timestamp: startedAt, type: 'manual', jobCount: data.jobs.length, status: 'success' });
     await store.setJSON('candidate-profile', { ...profile, lastRun: completedAt });
 
     console.log(`[run:${runId}] Done — ${data.jobs.length} jobs, emailSent: ${emailSent}`);
@@ -349,7 +349,7 @@ export default async (req: Request): Promise<Response> => {
       error: message,
     } satisfies RunResult);
 
-    await appendRun({ id: runId, timestamp: runId, type: 'manual', jobCount: 0, status: 'error', error: message });
+    await appendRun({ id: runId, timestamp: startedAt, type: 'manual', jobCount: 0, status: 'error', error: message });
   }
 
   return Response.json({ ok: true });
